@@ -83,7 +83,8 @@ PY
 
 ```bash
 uv pip install -U pip setuptools wheel
-uv pip install numpy scipy pandas matplotlib cshogi
+uv pip install numpy scipy pandas matplotlib
+uv pip install "git+https://github.com/akio-kobayashi/cshogi.git"
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 uv pip install -e .
 ```
