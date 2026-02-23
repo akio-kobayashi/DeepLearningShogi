@@ -138,21 +138,24 @@ class DataModule(pl.LightningDataModule):
         self.save_hyperparameters()
 
     def setup(self, stage: str):
-        # Assign train/val datasets for use in dataloaders
         if stage == "fit":
-            self.train_dataset = Hcpe3Dataset(
-                self.hparams.train_files,
-                self.hparams.use_average,
-                self.hparams.use_evalfix,
-                self.hparams.temperature,
-                self.hparams.patch,
-                self.hparams.cache,
-            )
-            self.val_dataset = HcpeDataset(self.hparams.val_files)
+            self._setup_fit_datasets()
+        if stage in ("test", "predict"):
+            self._setup_eval_dataset()
 
-        # Assign test dataset for use in dataloader(s)
-        if stage == "test" or stage == "predict":
-            self.val_dataset = HcpeDataset(self.hparams.val_files)
+    def _setup_fit_datasets(self):
+        self.train_dataset = Hcpe3Dataset(
+            self.hparams.train_files,
+            self.hparams.use_average,
+            self.hparams.use_evalfix,
+            self.hparams.temperature,
+            self.hparams.patch,
+            self.hparams.cache,
+        )
+        self._setup_eval_dataset()
+
+    def _setup_eval_dataset(self):
+        self.val_dataset = HcpeDataset(self.hparams.val_files)
 
     def train_dataloader(self):
         return DataLoader(

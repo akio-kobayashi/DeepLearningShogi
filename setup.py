@@ -40,6 +40,9 @@ setup(
     author = 'Tadao Yamaoka',
     url='https://github.com/TadaoYamaoka/DeepLearningShogi',
     packages = ['dlshogi', 'dlshogi.network', 'dlshogi.utils'],
+    install_requires=[
+        'PyYAML>=6.0',
+    ],
     ext_modules=ext_modules,
     cmdclass={'build_ext': my_build_ext},
     description = 'DeepLearningShogi(dlshogi)',
