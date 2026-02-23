@@ -2,19 +2,7 @@
 import torch.nn as nn
 
 from dlshogi.common import *
-
-class Bias(nn.Module):
-    def __init__(self, shape):
-        super(Bias, self).__init__()
-        self.bias=nn.Parameter(torch.zeros(shape))
-
-    def forward(self, x):
-        return x + self.bias
-
-# An ordinary implementation of Swish function
-class Swish(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(x)
+from dlshogi.network.common import Bias, Swish
 
 class ResNetBlock(nn.Module):
     def __init__(self, channels, activation):

@@ -3,14 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dlshogi.common import *
-
-class Bias(nn.Module):
-    def __init__(self, shape):
-        super(Bias, self).__init__()
-        self.bias=nn.Parameter(torch.zeros(shape))
-
-    def forward(self, input):
-        return input + self.bias
+from dlshogi.network.common import Bias
 
 k = 192
 fcl = 256 # fully connected layers
