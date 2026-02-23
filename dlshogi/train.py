@@ -15,6 +15,7 @@ import argparse
 import sys
 import re
 import importlib
+from pathlib import Path
 
 import logging
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from typing import Any, Callable, Dict, Tuple
 
 
 LossFn = Callable[[Any, Any, Any, Any, Any], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 
 
 def setup_logging(log_path: str | None) -> None:
@@ -344,10 +347,137 @@ def save_checkpoint_file(
     torch.save(checkpoint, path)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _resolve_run_dir(args: argparse.Namespace) -> Path:
+    if args.checkpoint:
+        return Path(args.checkpoint.format(epoch=0, step=0)).parent
+    if args.model:
+        return Path(args.model.format(epoch=0, step=0)).parent
+    return Path(".")
+
+
+def save_hparams_yaml(args: argparse.Namespace) -> Path:
+    try:
+        import yaml
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "PyYAML is required to save hparams.yaml. Please install pyyaml."
+        ) from e
+
+    run_dir = _resolve_run_dir(args)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / "hparams.yaml"
+    with out_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(vars(args), f, allow_unicode=True, sort_keys=True)
+    return out_path
+
+
+def _dict_to_expr(class_path: str, init_args: dict[str, Any] | None) -> str:
+    if not init_args:
+        return f"{class_path}()"
+    args = ",".join(f"{k}={repr(v)}" for k, v in init_args.items())
+    return f"{class_path}({args})"
+
+
+def load_train_config(config_path: str | None) -> Dict[str, Any]:
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+
+    try:
+        import yaml
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "PyYAML is required for --config support. Please install pyyaml."
+        ) from e
+
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Invalid config format: {config_path}")
+
+    defaults: Dict[str, Any] = {}
+
+    # Flat schema: direct argparse key -> value
+    known_keys = {
+        "train_data", "test_data", "batchsize", "testbatchsize", "epoch", "network",
+        "checkpoint", "resume", "reset_optimizer", "model", "initmodel", "log",
+        "optimizer", "lr", "weight_decay", "lr_scheduler", "scheduler_step_mode",
+        "reset_scheduler", "clip_grad_max_norm", "use_critic", "beta", "val_lambda",
+        "val_lambda_decay_epoch", "gpu", "eval_interval", "use_swa", "swa_start_epoch",
+        "swa_freq", "swa_n_avr", "use_amp", "amp_dtype", "use_average", "use_evalfix",
+        "temperature", "patch", "cache",
+    }
+    for key in known_keys:
+        if key in cfg:
+            defaults[key] = cfg[key]
+
+    # Lightning-style schema support (config.yaml compatibility)
+    data_cfg = cfg.get("data", {}) if isinstance(cfg.get("data", {}), dict) else {}
+    model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model", {}), dict) else {}
+    trainer_cfg = cfg.get("trainer", {}) if isinstance(cfg.get("trainer", {}), dict) else {}
+    opt_cfg = cfg.get("optimizer", {}) if isinstance(cfg.get("optimizer", {}), dict) else {}
+    sched_cfg = cfg.get("lr_scheduler", {}) if isinstance(cfg.get("lr_scheduler", {}), dict) else {}
+
+    if "train_data" not in defaults and "train_files" in data_cfg:
+        defaults["train_data"] = data_cfg["train_files"]
+    if "test_data" not in defaults and "val_files" in data_cfg and data_cfg["val_files"]:
+        defaults["test_data"] = data_cfg["val_files"][0]
+    if "batchsize" not in defaults and "batch_size" in data_cfg:
+        defaults["batchsize"] = data_cfg["batch_size"]
+    if "testbatchsize" not in defaults and "val_batch_size" in data_cfg:
+        defaults["testbatchsize"] = data_cfg["val_batch_size"]
+    for src, dst in [
+        ("use_average", "use_average"),
+        ("use_evalfix", "use_evalfix"),
+        ("temperature", "temperature"),
+        ("patch", "patch"),
+        ("cache", "cache"),
+    ]:
+        if dst not in defaults and src in data_cfg:
+            defaults[dst] = data_cfg[src]
+
+    if "network" not in defaults and "network" in model_cfg:
+        defaults["network"] = model_cfg["network"]
+    if "val_lambda" not in defaults and "val_lambda" in model_cfg:
+        defaults["val_lambda"] = model_cfg["val_lambda"]
+    if "val_lambda_decay_epoch" not in defaults and "val_lambda_decay_epoch" in model_cfg:
+        defaults["val_lambda_decay_epoch"] = model_cfg["val_lambda_decay_epoch"]
+    if "model" not in defaults and "model_filename" in model_cfg:
+        defaults["model"] = model_cfg["model_filename"]
+
+    if "epoch" not in defaults and "max_epochs" in trainer_cfg:
+        defaults["epoch"] = trainer_cfg["max_epochs"]
+    if "clip_grad_max_norm" not in defaults and "gradient_clip_val" in trainer_cfg:
+        defaults["clip_grad_max_norm"] = trainer_cfg["gradient_clip_val"]
+
+    if "optimizer" not in defaults and "class_path" in opt_cfg:
+        defaults["optimizer"] = _dict_to_expr(opt_cfg["class_path"], opt_cfg.get("init_args", {}))
+    if "lr" not in defaults and isinstance(opt_cfg.get("init_args"), dict) and "lr" in opt_cfg["init_args"]:
+        defaults["lr"] = opt_cfg["init_args"]["lr"]
+    if (
+        "weight_decay" not in defaults
+        and isinstance(opt_cfg.get("init_args"), dict)
+        and "weight_decay" in opt_cfg["init_args"]
+    ):
+        defaults["weight_decay"] = opt_cfg["init_args"]["weight_decay"]
+
+    if "lr_scheduler" not in defaults and "class_path" in sched_cfg:
+        defaults["lr_scheduler"] = _dict_to_expr(
+            sched_cfg["class_path"], sched_cfg.get("init_args", {})
+        )
+    if "scheduler_step_mode" not in defaults and "lr_scheduler_interval" in model_cfg:
+        defaults["scheduler_step_mode"] = model_cfg["lr_scheduler_interval"]
+
+    return defaults
+
+
+def build_parser(config_defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Train policy value network')
-    parser.add_argument('train_data', type=str, nargs='+', help='training data file')
-    parser.add_argument('test_data', type=str, help='test data file')
+    parser.add_argument('--config', type=str, default=str(DEFAULT_CONFIG_PATH), help='config yaml file')
+    parser.add_argument('train_data', type=str, nargs='*', help='training data file')
+    parser.add_argument('test_data', type=str, nargs='?', help='test data file')
     parser.add_argument('--batchsize', '-b', type=int, default=1024, help='Number of positions in each mini-batch')
     parser.add_argument('--testbatchsize', type=int, default=1024, help='Number of positions in each test mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=1, help='Number of epoch times')
@@ -382,6 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--patch', type=str, help='Overwrite with the hcpe')
     parser.add_argument('--cache', type=str, help='training data cache file')
+    parser.set_defaults(**config_defaults)
     return parser
 
 
@@ -723,10 +854,22 @@ def save_final_model(
 
 
 def main(*argv):
-    parser = build_parser()
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument('--config', type=str, default=str(DEFAULT_CONFIG_PATH))
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    config_defaults = load_train_config(pre_args.config)
+    parser = build_parser(config_defaults)
     args = parser.parse_args(argv)
 
+    if not args.train_data:
+        parser.error("train_data is required (CLI or config.yaml)")
+    if not args.test_data:
+        parser.error("test_data is required (CLI or config.yaml)")
+
     setup_logging(args.log)
+    hparams_path = save_hparams_yaml(args)
+    logging.info("saved hparams.yaml to {}".format(hparams_path))
     log_training_config(args)
     val_lambda = args.val_lambda
 
