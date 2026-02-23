@@ -86,6 +86,9 @@ def _build_pattern_network_kwargs(parsed: Match[str]):
 
 
 def policy_value_network(network: str, add_sigmoid: bool = False) -> nn.Module:
+    # Parallel-introduction note:
+    # - Legacy families are kept as-is.
+    # - New families (e.g. "resnetx10") can be added side-by-side.
     parsed = _NETWORK_PATTERN.match(network)
     policy_value_network_cls = _resolve_policy_value_network_class(network, parsed)
 

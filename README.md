@@ -72,5 +72,19 @@ python -m dlshogi.train --config dlshogi/config.yaml --lr 0.0005 --epoch 10
 2. `--model` の出力先ディレクトリ
 3. カレントディレクトリ
 
+### 並列導入ネットワーク（resnetx）
+既存のネットワーク実装を維持したまま、実験用の新実装を並列導入しています。
+`--network` で以下のように選択可能です。
+
+```bash
+# 新実装（並列導入）
+--network resnetx10
+--network resnetx20x256_fcl384_swish
+
+# 既存実装（従来どおり）
+--network resnet10_swish
+--network wideresnet10
+```
+
 ## ライセンス
 ライセンスはGPL3ライセンスとします。
