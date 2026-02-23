@@ -1,6 +1,7 @@
 import logging
 import os
 from collections import defaultdict
+from typing import Any, DefaultDict
 
 import lightning.pytorch as pl
 import numpy as np
@@ -18,10 +19,12 @@ from dlshogi.data_loader import DataLoader as HcpeDataLoader
 from dlshogi.data_loader import Hcpe3DataLoader
 from dlshogi.network.policy_value_network import policy_value_network
 
+PL_CORE_LOGGER = "lightning.pytorch.core"
+
 
 class HcpeDataset(Dataset):
     def __init__(self, files):
-        logger = logging.getLogger("lightning.pytorch.core")
+        logger = logging.getLogger(PL_CORE_LOGGER)
         logger.info("Loading HcpeDataset")
         self.hcpe = HcpeDataLoader.load_files(files, logger)
         logger.info("position num = {}".format(len(self.hcpe)))
@@ -66,7 +69,7 @@ class Hcpe3Dataset(Dataset):
         self.load()
 
     def load(self):
-        logger = logging.getLogger("lightning.pytorch.core")
+        logger = logging.getLogger(PL_CORE_LOGGER)
         logger.info("Loading Hcpe3Dataset")
         self.len, actual_len = Hcpe3DataLoader.load_files(
             self.files,
@@ -159,20 +162,19 @@ class DataModule(pl.LightningDataModule):
             collate_fn=collate,
         )
 
-    def val_dataloader(self):
+    def _eval_dataloader(self):
         return DataLoader(
             self.val_dataset, batch_size=self.hparams.val_batch_size, collate_fn=collate
         )
+
+    def val_dataloader(self):
+        return self._eval_dataloader()
 
     def test_dataloader(self):
-        return DataLoader(
-            self.val_dataset, batch_size=self.hparams.val_batch_size, collate_fn=collate
-        )
+        return self._eval_dataloader()
 
     def predict_dataloader(self):
-        return DataLoader(
-            self.val_dataset, batch_size=self.hparams.val_batch_size, collate_fn=collate
-        )
+        return self._eval_dataloader()
 
 
 def cross_entropy_loss_with_soft_target(pred, soft_targets):
@@ -191,6 +193,38 @@ def binary_accuracy(y, t):
     pred = y >= 0
     truth = t >= 0.5
     return pred.eq(truth).sum() / len(t)
+
+
+def compute_policy_value_losses(y1, y2, t1, t2, value, val_lambda, soft_target):
+    if soft_target:
+        loss1 = cross_entropy_loss_with_soft_target(y1, t1).mean()
+    else:
+        loss1 = cross_entropy_loss(y1, t1).mean()
+    loss2 = bce_with_logits_loss(y2, t2)
+    loss3 = bce_with_logits_loss(y2, value)
+    loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+    return loss1, loss2, loss3, loss
+
+
+def append_validation_metrics(validation_step_outputs, y1, y2, move, result, loss1, loss2, loss3, loss):
+    validation_step_outputs["val/loss"].append(loss)
+    validation_step_outputs["val/policy_loss"].append(loss1)
+    validation_step_outputs["val/result_loss"].append(loss2)
+    validation_step_outputs["val/value_loss"].append(loss3)
+
+    validation_step_outputs["val/policy_accuracy"].append(accuracy(y1, move))
+    validation_step_outputs["val/value_accuracy"].append(
+        binary_accuracy(y2, result)
+    )
+
+    entropy1 = (-F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1)
+    validation_step_outputs["val/policy_entropy"].append(entropy1.mean())
+
+    p2 = y2.sigmoid()
+    # entropy2 = -(p2 * F.log(p2) + (1 - p2) * F.log(1 - p2))
+    log1p_ey2 = F.softplus(y2)
+    entropy2 = -(p2 * (y2 - log1p_ey2) + (1 - p2) * -log1p_ey2)
+    validation_step_outputs["val/value_entropy"].append(entropy2.mean())
 
 
 class Model(pl.LightningModule):
@@ -219,8 +253,21 @@ class Model(pl.LightningModule):
                 self.model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay)
             )
             self.ema_model.requires_grad_(False)
-        self.validation_step_outputs = defaultdict(list)
+        self.validation_step_outputs: DefaultDict[str, list[Any]] = defaultdict(list)
         self.val_lambda = val_lambda
+
+    def _should_update_ema_bn(self) -> bool:
+        return (
+            self.hparams.use_ema
+            and self.hparams.update_bn
+            and self.current_epoch == self.trainer.max_epochs - 1
+            and self.current_epoch >= self.hparams.ema_start_epoch
+        )
+
+    def _active_model_for_save(self):
+        if self.hparams.use_ema:
+            return self.ema_model
+        return self.model
 
     def on_train_epoch_start(self):
         # update val_lambda
@@ -234,13 +281,14 @@ class Model(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         features1, features2, probability, result, value = batch
         y1, y2 = self.model(features1, features2)
-        loss1 = cross_entropy_loss_with_soft_target(y1, probability).mean()
-        loss2 = bce_with_logits_loss(y2, result)
-        loss3 = bce_with_logits_loss(y2, value)
-        loss = (
-            loss1
-            + (1 - self.hparams.val_lambda) * loss2
-            + self.hparams.val_lambda * loss3
+        loss1, loss2, loss3, loss = compute_policy_value_losses(
+            y1,
+            y2,
+            probability,
+            result,
+            value,
+            self.hparams.val_lambda,
+            soft_target=True,
         )
         self.log("train/loss", loss)
         self.log("train/policy_loss", loss1)
@@ -257,12 +305,7 @@ class Model(pl.LightningModule):
             self.ema_model.update_parameters(self.model)
 
     def on_train_epoch_end(self):
-        if (
-            self.hparams.use_ema
-            and self.hparams.update_bn
-            and self.current_epoch == self.trainer.max_epochs - 1
-            and self.current_epoch >= self.hparams.ema_start_epoch
-        ):
+        if self._should_update_ema_bn():
 
             def data_loader():
                 for x1, x2, _, _, _ in Tqdm(
@@ -281,10 +324,7 @@ class Model(pl.LightningModule):
 
     def on_fit_end(self):
         if self.hparams.model_filename:
-            if self.hparams.use_ema:
-                model = self.ema_model
-            else:
-                model = self.model
+            model = self._active_model_for_save()
             model_filename = self.hparams.model_filename.format(
                 epoch=self.current_epoch, step=self.global_step
             )
@@ -296,32 +336,26 @@ class Model(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         features1, features2, move, result, value = batch
         y1, y2 = self.model(features1, features2)
-        loss1 = cross_entropy_loss(y1, move).mean()
-        loss2 = bce_with_logits_loss(y2, result)
-        loss3 = bce_with_logits_loss(y2, value)
-        loss = (
-            loss1
-            + (1 - self.hparams.val_lambda) * loss2
-            + self.hparams.val_lambda * loss3
+        loss1, loss2, loss3, loss = compute_policy_value_losses(
+            y1,
+            y2,
+            move,
+            result,
+            value,
+            self.hparams.val_lambda,
+            soft_target=False,
         )
-        self.validation_step_outputs["val/loss"].append(loss)
-        self.validation_step_outputs["val/policy_loss"].append(loss1)
-        self.validation_step_outputs["val/result_loss"].append(loss2)
-        self.validation_step_outputs["val/value_loss"].append(loss3)
-
-        self.validation_step_outputs["val/policy_accuracy"].append(accuracy(y1, move))
-        self.validation_step_outputs["val/value_accuracy"].append(
-            binary_accuracy(y2, result)
+        append_validation_metrics(
+            self.validation_step_outputs,
+            y1,
+            y2,
+            move,
+            result,
+            loss1,
+            loss2,
+            loss3,
+            loss,
         )
-
-        entropy1 = (-F.softmax(y1, dim=1) * F.log_softmax(y1, dim=1)).sum(dim=1)
-        self.validation_step_outputs["val/policy_entropy"].append(entropy1.mean())
-
-        p2 = y2.sigmoid()
-        # entropy2 = -(p2 * F.log(p2) + (1 - p2) * F.log(1 - p2))
-        log1p_ey2 = F.softplus(y2)
-        entropy2 = -(p2 * (y2 - log1p_ey2) + (1 - p2) * -log1p_ey2)
-        self.validation_step_outputs["val/value_entropy"].append(entropy2.mean())
 
     def on_validation_epoch_end(self):
         for key, val in self.validation_step_outputs.items():
