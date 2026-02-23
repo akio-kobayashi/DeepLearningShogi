@@ -10,17 +10,33 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 
 
+def _load_files_by_dtype(files, dtype, logger=logging) -> np.ndarray:
+    data = []
+    for path in files:
+        if os.path.exists(path):
+            logger.info(path)
+            data.append(np.fromfile(path, dtype=dtype))
+        else:
+            logger.warning("{} not found, skipping".format(path))
+    return np.concatenate(data)
+
+
+def _move_tensor(
+    tensor: torch.Tensor,
+    device: torch.device,
+    clone_on_cpu: bool = False,
+) -> torch.Tensor:
+    if device.type == "cpu":
+        if clone_on_cpu:
+            return tensor.clone()
+        return tensor
+    return tensor.to(device)
+
+
 class DataLoader:
     @staticmethod
     def load_files(files, logger=logging):
-        data = []
-        for path in files:
-            if os.path.exists(path):
-                logger.info(path)
-                data.append(np.fromfile(path, dtype=HuffmanCodedPosAndEval))
-            else:
-                logger.warn("{} not found, skipping".format(path))
-        return np.concatenate(data)
+        return _load_files_by_dtype(files, HuffmanCodedPosAndEval, logger)
 
     def __init__(self, data, batch_size, device, shuffle=False):
         self.data = data
@@ -56,22 +72,13 @@ class DataLoader:
             hcpevec, self.features1, self.features2, self.move, self.result, self.value
         )
 
-        if self.device.type == "cpu":
-            return (
-                self.torch_features1.clone(),
-                self.torch_features2.clone(),
-                self.torch_move.clone(),
-                self.torch_result.clone(),
-                self.torch_value.clone(),
-            )
-        else:
-            return (
-                self.torch_features1.to(self.device),
-                self.torch_features2.to(self.device),
-                self.torch_move.to(self.device),
-                self.torch_result.to(self.device),
-                self.torch_value.to(self.device),
-            )
+        return (
+            _move_tensor(self.torch_features1, self.device, clone_on_cpu=True),
+            _move_tensor(self.torch_features2, self.device, clone_on_cpu=True),
+            _move_tensor(self.torch_move, self.device, clone_on_cpu=True),
+            _move_tensor(self.torch_result, self.device, clone_on_cpu=True),
+            _move_tensor(self.torch_value, self.device, clone_on_cpu=True),
+        )
 
     def sample(self):
         return self.mini_batch(
@@ -106,14 +113,7 @@ class DataLoader:
 class Hcpe2DataLoader(DataLoader):
     @staticmethod
     def load_files(files, logger=logging):
-        data = []
-        for path in files:
-            if os.path.exists(path):
-                logger.info(path)
-                data.append(np.fromfile(path, dtype=HuffmanCodedPosAndEval2))
-            else:
-                logger.warn("{} not found, skipping".format(path))
-        return np.concatenate(data)
+        return _load_files_by_dtype(files, HuffmanCodedPosAndEval2, logger)
 
     def __init__(self, data, batch_size, device, shuffle=False):
         self.data = data
@@ -170,7 +170,7 @@ class Hcpe2DataLoader(DataLoader):
 
 
 # 評価値から勝率への変換
-def score_to_value(score, a):
+def score_to_value(score, a) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-score / a))
 
 
@@ -214,7 +214,7 @@ class Hcpe3DataLoader(DataLoader):
                     raise RuntimeError("read error {}".format(path))
                 actual_len += len_
             else:
-                logger.warn("{} not found, skipping".format(path))
+                logger.warning("{} not found, skipping".format(path))
         if patch:
             # パッチを当てる
             patch_sum_len, patch_add_len = cppshogi.hcpe3_patch_with_hcpe(patch)
