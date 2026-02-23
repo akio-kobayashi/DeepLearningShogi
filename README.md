@@ -53,5 +53,24 @@ http://tadaoyamaoka.hatenablog.com/
 * 探索部の一部にLeela Chess Zeroのソースコードを流用しています。
 * 王手生成などに、[やねうら王](https://github.com/yaneurao/YaneuraOu)のソースコードを流用しています。
 
+## 学習設定（train.py）
+`dlshogi/train.py` は `dlshogi/config.yaml` を既定設定として読み込み、コマンドライン引数で上書きできます。
+
+例:
+```bash
+python -m dlshogi.train --config dlshogi/config.yaml --lr 0.0005 --epoch 10
+```
+
+優先順位:
+1. CLI引数
+2. `--config` で指定した YAML
+3. `train.py` 内のデフォルト値
+
+また学習開始時に、実行ディレクトリへ `hparams.yaml` を保存します。
+実行ディレクトリは以下の順で決まります。
+1. `--checkpoint` の出力先ディレクトリ
+2. `--model` の出力先ディレクトリ
+3. カレントディレクトリ
+
 ## ライセンス
 ライセンスはGPL3ライセンスとします。

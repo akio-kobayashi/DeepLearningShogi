@@ -137,13 +137,13 @@ class DataModule(pl.LightningDataModule):
         super().__init__()
         self.save_hyperparameters()
 
-    def setup(self, stage: str):
+    def setup(self, stage: str) -> None:
         if stage == "fit":
             self._setup_fit_datasets()
         if stage in ("test", "predict"):
             self._setup_eval_dataset()
 
-    def _setup_fit_datasets(self):
+    def _setup_fit_datasets(self) -> None:
         self.train_dataset = Hcpe3Dataset(
             self.hparams.train_files,
             self.hparams.use_average,
@@ -154,10 +154,10 @@ class DataModule(pl.LightningDataModule):
         )
         self._setup_eval_dataset()
 
-    def _setup_eval_dataset(self):
+    def _setup_eval_dataset(self) -> None:
         self.val_dataset = HcpeDataset(self.hparams.val_files)
 
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
             batch_size=self.hparams.batch_size,
@@ -165,22 +165,22 @@ class DataModule(pl.LightningDataModule):
             collate_fn=collate,
         )
 
-    def _eval_dataloader(self):
+    def _eval_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_dataset, batch_size=self.hparams.val_batch_size, collate_fn=collate
         )
 
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
         return self._eval_dataloader()
 
-    def test_dataloader(self):
+    def test_dataloader(self) -> DataLoader:
         return self._eval_dataloader()
 
-    def predict_dataloader(self):
+    def predict_dataloader(self) -> DataLoader:
         return self._eval_dataloader()
 
 
-def cross_entropy_loss_with_soft_target(pred, soft_targets):
+def cross_entropy_loss_with_soft_target(pred, soft_targets) -> torch.Tensor:
     return torch.sum(-soft_targets * F.log_softmax(pred, dim=1), 1)
 
 
@@ -188,11 +188,11 @@ cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction="none")
 bce_with_logits_loss = torch.nn.BCEWithLogitsLoss()
 
 
-def accuracy(y, t):
+def accuracy(y, t) -> torch.Tensor:
     return (torch.max(y, 1)[1] == t).sum() / len(t)
 
 
-def binary_accuracy(y, t):
+def binary_accuracy(y, t) -> torch.Tensor:
     pred = y >= 0
     truth = t >= 0.5
     return pred.eq(truth).sum() / len(t)
@@ -209,7 +209,7 @@ def compute_policy_value_losses(y1, y2, t1, t2, value, val_lambda, soft_target):
     return loss1, loss2, loss3, loss
 
 
-def append_validation_metrics(validation_step_outputs, y1, y2, move, result, loss1, loss2, loss3, loss):
+def append_validation_metrics(validation_step_outputs, y1, y2, move, result, loss1, loss2, loss3, loss) -> None:
     validation_step_outputs["val/loss"].append(loss)
     validation_step_outputs["val/policy_loss"].append(loss1)
     validation_step_outputs["val/result_loss"].append(loss2)
@@ -267,12 +267,12 @@ class Model(pl.LightningModule):
             and self.current_epoch >= self.hparams.ema_start_epoch
         )
 
-    def _active_model_for_save(self):
+    def _active_model_for_save(self) -> torch.nn.Module:
         if self.hparams.use_ema:
             return self.ema_model
         return self.model
 
-    def on_train_epoch_start(self):
+    def on_train_epoch_start(self) -> None:
         # update val_lambda
         if self.hparams.val_lambda_decay_epoch:
             self.val_lambda = max(
@@ -281,7 +281,7 @@ class Model(pl.LightningModule):
             )
             self.log("val_lambda", self.val_lambda)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx) -> torch.Tensor:
         features1, features2, probability, result, value = batch
         y1, y2 = self.model(features1, features2)
         loss1, loss2, loss3, loss = compute_policy_value_losses(
@@ -299,7 +299,7 @@ class Model(pl.LightningModule):
         self.log("train/value_loss", loss3)
         return loss
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
         if (
             self.hparams.use_ema
             and self.current_epoch >= self.hparams.ema_start_epoch
@@ -307,7 +307,7 @@ class Model(pl.LightningModule):
         ):
             self.ema_model.update_parameters(self.model)
 
-    def on_train_epoch_end(self):
+    def on_train_epoch_end(self) -> None:
         if self._should_update_ema_bn():
 
             def data_loader():
@@ -325,7 +325,7 @@ class Model(pl.LightningModule):
                 update_bn(data_loader(), self.ema_model)
             del self.ema_model.forward
 
-    def on_fit_end(self):
+    def on_fit_end(self) -> None:
         if self.hparams.model_filename:
             model = self._active_model_for_save()
             model_filename = self.hparams.model_filename.format(
@@ -336,7 +336,7 @@ class Model(pl.LightningModule):
                 model,
             )
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx) -> None:
         features1, features2, move, result, value = batch
         y1, y2 = self.model(features1, features2)
         loss1, loss2, loss3, loss = compute_policy_value_losses(
@@ -360,7 +360,7 @@ class Model(pl.LightningModule):
             loss,
         )
 
-    def on_validation_epoch_end(self):
+    def on_validation_epoch_end(self) -> None:
         for key, val in self.validation_step_outputs.items():
             self.log(key, torch.stack(val).mean(), sync_dist=True)
             val.clear()
@@ -371,16 +371,16 @@ class Model(pl.LightningModule):
             self.model = self.ema_model
         return super().on_test_start()
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch, batch_idx) -> None:
         self.validation_step(batch, batch_idx)
 
-    def on_test_epoch_end(self):
+    def on_test_epoch_end(self) -> None:
         for key, val in self.validation_step_outputs.items():
             key = "test" + key[3:]
             self.log(key, torch.stack(val).mean(), sync_dist=True)
             val.clear()
 
-    def on_test_end(self):
+    def on_test_end(self) -> None:
         super().on_test_end()
         if self.hparams.use_ema:
             self.model = self.tmp_model

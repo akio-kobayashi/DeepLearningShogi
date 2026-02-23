@@ -516,6 +516,48 @@ def build_parser(config_defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     return parser
 
 
+def validate_train_args(args: argparse.Namespace) -> None:
+    int_fields = (
+        "batchsize",
+        "testbatchsize",
+        "epoch",
+        "eval_interval",
+        "swa_start_epoch",
+        "swa_freq",
+        "swa_n_avr",
+    )
+    float_non_negative_fields = (
+        "lr",
+        "clip_grad_max_norm",
+        "temperature",
+    )
+    for name in int_fields:
+        value = getattr(args, name)
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer: {value}")
+    for name in float_non_negative_fields:
+        value = getattr(args, name)
+        if not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"{name} must be non-negative: {value}")
+    if not isinstance(args.val_lambda, (int, float)) or not (0.0 <= args.val_lambda <= 1.0):
+        raise ValueError(f"val_lambda must be in [0, 1]: {args.val_lambda}")
+    if args.val_lambda_decay_epoch is not None:
+        if not isinstance(args.val_lambda_decay_epoch, int) or args.val_lambda_decay_epoch <= 0:
+            raise ValueError(
+                f"val_lambda_decay_epoch must be a positive integer or null: {args.val_lambda_decay_epoch}"
+            )
+    if args.scheduler_step_mode not in ("epoch", "step"):
+        raise ValueError(f"scheduler_step_mode must be 'epoch' or 'step': {args.scheduler_step_mode}")
+    if args.amp_dtype not in ("float16", "bfloat16"):
+        raise ValueError(f"amp_dtype must be 'float16' or 'bfloat16': {args.amp_dtype}")
+    if args.weight_decay < 0 and args.weight_decay != -1:
+        raise ValueError(
+            f"weight_decay must be >= 0 or -1 to preserve optimizer state: {args.weight_decay}"
+        )
+    if args.gpu < -1:
+        raise ValueError(f"gpu must be -1 (cpu) or >= 0: {args.gpu}")
+
+
 def setup_optimizer_scheduler_swa(
     args: argparse.Namespace,
     model: torch.nn.Module,
@@ -866,6 +908,7 @@ def main(*argv):
         parser.error("train_data is required (CLI or config.yaml)")
     if not args.test_data:
         parser.error("test_data is required (CLI or config.yaml)")
+    validate_train_args(args)
 
     setup_logging(args.log)
     hparams_path = save_hparams_yaml(args)
