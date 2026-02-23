@@ -70,52 +70,30 @@ class PolicyValueNetwork(nn.Module):
         u1_1_1 = self.l1_1_1(x1)
         u1_1_2 = self.l1_1_2(x1)
         u1_2 = self.l1_2(x2)
-        u1 = self.swish(self.norm1(u1_1_1 + u1_1_2 + u1_2))
-        # Residual block
-        h2 = self.swish(self.norm2(self.l2(u1)))
-        h3 = self.norm3(self.l3(h2))
-        u3 = self.swish(h3 + u1)
-        # Residual block
-        h4 = self.swish(self.norm4(self.l4(u3)))
-        h5 = self.norm5(self.l5(h4))
-        u5 = self.swish(h5 + u3)
-        # Residual block
-        h6 = self.swish(self.norm6(self.l6(u5)))
-        h7 = self.norm7(self.l7(h6))
-        u7 = self.swish(h7 + u5)
-        # Residual block
-        h8 = self.swish(self.norm8(self.l8(u7)))
-        h9 = self.norm9(self.l9(h8))
-        u9 = self.swish(h9 + u7)
-        # Residual block
-        h10 = self.swish(self.norm10(self.l10(u9)))
-        h11 = self.norm11(self.l11(h10))
-        u11 = self.swish(h11 + u9)
-        # Residual block
-        h12 = self.swish(self.norm12(self.l12(u11)))
-        h13 = self.norm13(self.l13(h12))
-        u13 = self.swish(h13 + u11)
-        # Residual block
-        h14 = self.swish(self.norm14(self.l14(u13)))
-        h15 = self.norm15(self.l15(h14))
-        u15 = self.swish(h15 + u13)
-        # Residual block
-        h16 = self.swish(self.norm16(self.l16(u15)))
-        h17 = self.norm17(self.l17(h16))
-        u17 = self.swish(h17 + u15)
-        # Residual block
-        h18 = self.swish(self.norm18(self.l18(u17)))
-        h19 = self.norm19(self.l19(h18))
-        u19 = self.swish(h19 + u17)
-        # Residual block
-        h20 = self.swish(self.norm20(self.l20(u19)))
-        h21 = self.norm21(self.l21(h20))
-        u21 = self.swish(h21 + u19)
+        u = self.swish(self.norm1(u1_1_1 + u1_1_2 + u1_2))
+
+        residual_layers = (
+            (self.norm2, self.l2, self.norm3, self.l3),
+            (self.norm4, self.l4, self.norm5, self.l5),
+            (self.norm6, self.l6, self.norm7, self.l7),
+            (self.norm8, self.l8, self.norm9, self.l9),
+            (self.norm10, self.l10, self.norm11, self.l11),
+            (self.norm12, self.l12, self.norm13, self.l13),
+            (self.norm14, self.l14, self.norm15, self.l15),
+            (self.norm16, self.l16, self.norm17, self.l17),
+            (self.norm18, self.l18, self.norm19, self.l19),
+            (self.norm20, self.l20, self.norm21, self.l21),
+        )
+        for norm_a, conv_a, norm_b, conv_b in residual_layers:
+            h = self.swish(norm_a(conv_a(u)))
+            h = norm_b(conv_b(h))
+            u = self.swish(h + u)
+
         # policy network
-        h22 = self.l22(u21)
+        h22 = self.l22(u)
         h22_1 = self.l22_2(torch.flatten(h22, 1))
         # value network
-        h22_v = self.swish(self.norm22_v(self.l22_v(u21)))
+        h22_v = self.swish(self.norm22_v(self.l22_v(u)))
         h23_v = self.swish(self.l23_v(torch.flatten(h22_v, 1)))
         return h22_1, self.l24_v(h23_v)
 
