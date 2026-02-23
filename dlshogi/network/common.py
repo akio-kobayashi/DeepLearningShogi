@@ -4,7 +4,7 @@ import torch.nn as nn
 
 class Bias(nn.Module):
     def __init__(self, shape):
-        super(Bias, self).__init__()
+        super().__init__()
         self.bias = nn.Parameter(torch.zeros(shape))
 
     def forward(self, x):
@@ -16,4 +16,3 @@ class Swish(nn.Module):
 
     def forward(self, x):
         return x * torch.sigmoid(x)
-

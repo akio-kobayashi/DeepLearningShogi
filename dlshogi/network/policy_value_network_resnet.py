@@ -6,7 +6,7 @@ from dlshogi.network.common import Bias, Swish
 
 class ResNetBlock(nn.Module):
     def __init__(self, channels, activation):
-        super(ResNetBlock, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
@@ -24,8 +24,10 @@ class ResNetBlock(nn.Module):
         return self.act(out + x)
 
 class PolicyValueNetwork(nn.Module):
-    def __init__(self, blocks, channels, activation=nn.ReLU(), fcl=256):
-        super(PolicyValueNetwork, self).__init__()
+    def __init__(self, blocks, channels, activation=None, fcl=256):
+        super().__init__()
+        if activation is None:
+            activation = nn.ReLU()
         self.l1_1_1 = nn.Conv2d(in_channels=FEATURES1_NUM, out_channels=channels, kernel_size=3, padding=1, bias=False)
         self.l1_1_2 = nn.Conv2d(in_channels=FEATURES1_NUM, out_channels=channels, kernel_size=1, padding=0, bias=False)
         self.l1_2 = nn.Conv2d(in_channels=FEATURES2_NUM, out_channels=channels, kernel_size=1, bias=False) # pieces_in_hand
@@ -71,6 +73,6 @@ class PolicyValueNetwork(nn.Module):
             memory_efficient (bool): Whether to use memory-efficient version of swish.
         """
         activation = nn.SiLU() if memory_efficient else Swish()
-        for n, m in self.named_modules():
-            if isinstance(m, PolicyValueNetwork) or isinstance(m, ResNetBlock):
+        for _, m in self.named_modules():
+            if isinstance(m, (PolicyValueNetwork, ResNetBlock)):
                 m.act = activation

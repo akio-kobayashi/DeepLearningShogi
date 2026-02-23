@@ -6,23 +6,23 @@ from dlshogi.network.common import Bias, Swish
 
 class SELayer(nn.Module):
     def __init__(self, channels, activation, reduction):
-        super(SELayer, self).__init__()
+        super().__init__()
         self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1)
         self.act = activation
         self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1)
 
     def forward(self, x):
-        input = x
+        input_x = x
         x = x.mean((2, 3), keepdim=True)
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
         x = x.sigmoid()
-        return input * x
+        return input_x * x
 
 class SEResNetBlock(nn.Module):
     def __init__(self, channels, activation, reduction):
-        super(SEResNetBlock, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
@@ -47,8 +47,10 @@ class SEResNetBlock(nn.Module):
         return out
 
 class PolicyValueNetwork(nn.Module):
-    def __init__(self, blocks, channels, activation=nn.ReLU(), fcl=256, reduction=8):
-        super(PolicyValueNetwork, self).__init__()
+    def __init__(self, blocks, channels, activation=None, fcl=256, reduction=8):
+        super().__init__()
+        if activation is None:
+            activation = nn.ReLU()
         self.l1_1_1 = nn.Conv2d(in_channels=FEATURES1_NUM, out_channels=channels, kernel_size=3, padding=1, bias=False)
         self.l1_1_2 = nn.Conv2d(in_channels=FEATURES1_NUM, out_channels=channels, kernel_size=1, padding=0, bias=False)
         self.l1_2 = nn.Conv2d(in_channels=FEATURES2_NUM, out_channels=channels, kernel_size=1, bias=False) # pieces_in_hand
@@ -93,6 +95,6 @@ class PolicyValueNetwork(nn.Module):
         Args:
             memory_efficient (bool): Whether to use memory-efficient version of swish.
         """
-        for n, m in self.named_modules():
-            if isinstance(m, PolicyValueNetwork) or isinstance(m, SEResNetBlock) or isinstance(m, SELayer):
+        for _, m in self.named_modules():
+            if isinstance(m, (PolicyValueNetwork, SEResNetBlock, SELayer)):
                 m.act = nn.SiLU() if memory_efficient else Swish()
