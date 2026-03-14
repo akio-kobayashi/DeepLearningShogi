@@ -14,6 +14,9 @@
 #include <mutex>
 #include <memory>
 #include <signal.h>
+#include <algorithm>
+#include <limits>
+#include <numeric>
 
 #include "Node.h"
 #include "LruCache.h"
@@ -175,6 +178,12 @@ float c_fpu_reduction;
 float c_init_root;
 float c_base_root;
 float temperature;
+bool GUMBEL_ROOT = false;
+float GUMBEL_SCALE = 1.0f;
+float GUMBEL_PRIOR_WEIGHT = 1.0f;
+float GUMBEL_VALUE_WEIGHT = 1.0f;
+float GUMBEL_VISIT_WEIGHT = 0.25f;
+float GUMBEL_EXPORT_TEMPERATURE = 1.0f;
 
 
 typedef pair<uct_node_t*, unsigned int> trajectory_t;
@@ -258,6 +267,13 @@ inline s16 value_to_score(const float value) {
 		return -30000;
 	else
 		return s16(-logf(1.0f / value - 1.0f) * 756.0864962951762f);
+}
+
+inline float child_q_value(const child_node_t& child) {
+	if (child.IsLose()) return 1.0f;
+	if (child.IsWin()) return 0.0f;
+	if (child.move_count <= 0) return 0.5f;
+	return static_cast<float>(child.win / child.move_count);
 }
 
 // 詰み探索スロット
@@ -384,6 +400,13 @@ private:
 	bool InterruptionCheck(const int playout_count, const int extension_times);
 	void NextPly(const Move move);
 	void NextGame();
+	Move SelectGumbelRootMove(const child_node_t* uct_child, int child_num, float& best_wp);
+	std::vector<MoveVisits> BuildTrainingCandidates(const child_node_t* uct_child, int child_num) const;
+	std::vector<double> BuildGumbelPolicyWeights(const child_node_t* uct_child, int child_num) const;
+	void ResetGumbelRootState();
+	void InitializeGumbelRootState(const child_node_t* uct_child, int child_num);
+	void StartNextGumbelRound(const child_node_t* uct_child, int child_num);
+	double GumbelRootScore(const child_node_t* uct_child, int index) const;
 
 	// キャッシュからnnrateをコピー
 	void CopyNNRate(uct_node_t* node, const vector<float>& nnrate) {
@@ -391,6 +414,193 @@ private:
 		for (int i = 0; i < node->child_num; i++) {
 			uct_child[i].nnrate = nnrate[i];
 		}
+	}
+
+	std::vector<double> BuildGumbelPolicyWeights(const child_node_t* uct_child, int child_num) const {
+		std::vector<double> scores;
+		scores.reserve(child_num);
+		if (!GUMBEL_ROOT) {
+			for (int i = 0; i < child_num; ++i) {
+				const auto move_count = std::max(0, static_cast<int>(uct_child[i].move_count) - noise_count[i]);
+				scores.emplace_back(static_cast<double>(move_count));
+			}
+			return scores;
+		}
+
+		std::vector<double> logits;
+		logits.reserve(child_num);
+		for (int i = 0; i < child_num; ++i) {
+			if (i < static_cast<int>(root_gumbel_active.size()) && !root_gumbel_active[i]) {
+				logits.emplace_back(0.0);
+				continue;
+			}
+			logits.emplace_back(GumbelRootScore(uct_child, i));
+		}
+
+		const double temperature = std::max(1e-3f, GUMBEL_EXPORT_TEMPERATURE);
+		const double max_logit = *std::max_element(logits.begin(), logits.end());
+		for (double& logit : logits) {
+			logit = std::exp((logit - max_logit) / temperature);
+		}
+		return logits;
+	}
+
+	Move SelectGumbelRootMove(const child_node_t* uct_child, int child_num, float& best_wp) {
+		double best_score = -std::numeric_limits<double>::infinity();
+		int best_index = -1;
+
+		for (int i = 0; i < child_num; ++i) {
+			if (!root_gumbel_active.empty() && !root_gumbel_active[i]) {
+				continue;
+			}
+			if (uct_child[i].IsWin()) {
+				continue;
+			}
+			const double score = GumbelRootScore(uct_child, i);
+			if (score > best_score) {
+				best_score = score;
+				best_index = i;
+			}
+		}
+		if (best_index < 0) {
+			for (int i = 0; i < child_num; ++i) {
+				if (uct_child[i].IsWin()) {
+					continue;
+				}
+				const double score = GumbelRootScore(uct_child, i);
+				if (best_index < 0 || score > best_score) {
+					best_score = score;
+					best_index = i;
+				}
+			}
+		}
+		if (best_index < 0) {
+			best_index = 0;
+		}
+
+		best_wp = child_q_value(uct_child[best_index]);
+		if (uct_child[best_index].IsLose()) {
+			best_wp = 1.0f;
+		}
+		return uct_child[best_index].move;
+	}
+
+	void ResetGumbelRootState() {
+		root_gumbel_initialized = false;
+		root_gumbel_logits.clear();
+		root_gumbel_active.clear();
+		root_gumbel_round_visits.clear();
+		root_gumbel_round = 0;
+		root_gumbel_round_budget = 0;
+		root_gumbel_round_target = 0;
+	}
+
+	void InitializeGumbelRootState(const child_node_t* uct_child, int child_num) {
+		if (!GUMBEL_ROOT) {
+			return;
+		}
+		root_gumbel_logits.assign(child_num, -std::numeric_limits<double>::infinity());
+		root_gumbel_active.assign(child_num, false);
+		root_gumbel_round_visits.assign(child_num, 0);
+
+		std::uniform_real_distribution<double> unif(1e-12, 1.0 - 1e-12);
+		for (int i = 0; i < child_num; ++i) {
+			if (uct_child[i].IsWin()) {
+				continue;
+			}
+			const double gumbel = -std::log(-std::log(unif(*mt_64)));
+			const double prior = std::log(std::max(uct_child[i].nnrate, 1e-6f));
+			root_gumbel_logits[i] =
+				GUMBEL_SCALE * gumbel
+				+ GUMBEL_PRIOR_WEIGHT * prior;
+			root_gumbel_active[i] = true;
+			root_gumbel_round_visits[i] = static_cast<int>(uct_child[i].move_count);
+		}
+
+		root_gumbel_round = 0;
+		root_gumbel_round_budget = 0;
+		root_gumbel_round_target = 0;
+		root_gumbel_initialized = true;
+		StartNextGumbelRound(uct_child, child_num);
+	}
+
+	double GumbelRootScore(const child_node_t* uct_child, int index) const {
+		const double base =
+			index < static_cast<int>(root_gumbel_logits.size()) ?
+			root_gumbel_logits[index] :
+			GUMBEL_PRIOR_WEIGHT * std::log(std::max(uct_child[index].nnrate, 1e-6f));
+		const double q = child_q_value(uct_child[index]);
+		const double visits = std::log1p(std::max(0, static_cast<int>(uct_child[index].move_count) - noise_count[index]));
+		return base + GUMBEL_VALUE_WEIGHT * q + GUMBEL_VISIT_WEIGHT * visits;
+	}
+
+	void StartNextGumbelRound(const child_node_t* uct_child, int child_num) {
+		if (!root_gumbel_initialized) {
+			return;
+		}
+
+		int active_count = 0;
+		for (bool active : root_gumbel_active) {
+			if (active) {
+				active_count++;
+			}
+		}
+		if (active_count <= 0) {
+			return;
+		}
+
+		int remaining_rounds = 0;
+		for (int size = active_count; size > 0; size = (size + 1) / 2) {
+			remaining_rounds++;
+			if (size == 1) {
+				break;
+			}
+		}
+
+		int total_units = 0;
+		for (int size = active_count; size > 0; size = (size + 1) / 2) {
+			total_units += size;
+			if (size == 1) {
+				break;
+			}
+		}
+
+		const int remaining_playouts = std::max(0, max_playout_num - playout);
+		int budget = active_count;
+		if (remaining_rounds > 0 && total_units > 0 && remaining_playouts > 0) {
+			budget = std::max(active_count, (remaining_playouts * active_count + total_units - 1) / total_units);
+		}
+
+		root_gumbel_round++;
+		root_gumbel_round_budget = std::max(active_count, budget);
+		root_gumbel_round_target = std::max(1, (root_gumbel_round_budget + active_count - 1) / active_count);
+		for (int i = 0; i < child_num; ++i) {
+			root_gumbel_round_visits[i] = static_cast<int>(uct_child[i].move_count);
+		}
+	}
+
+	std::vector<MoveVisits> BuildTrainingCandidates(const child_node_t* uct_child, int child_num) const {
+		std::vector<MoveVisits> candidates;
+		candidates.reserve(child_num);
+
+		const auto weights = BuildGumbelPolicyWeights(uct_child, child_num);
+		const double weight_sum = std::accumulate(weights.begin(), weights.end(), 0.0);
+		if (weight_sum <= 0.0) {
+			return candidates;
+		}
+
+		const double total = std::max(1, playout);
+		for (int i = 0; i < child_num; ++i) {
+			if (weights[i] <= 0.0) {
+				continue;
+			}
+			const int count = std::max(1, static_cast<int>(std::lround(total * weights[i] / weight_sum)));
+			candidates.emplace_back(
+				static_cast<u16>(uct_child[i].move.value()),
+				static_cast<u16>(std::min(count, 65535))
+			);
+		}
+		return candidates;
 	}
 
 	UCTSearcherGroup* grp;
@@ -418,6 +628,13 @@ private:
 
 	// ノイズにより選んだ回数
 	std::vector<int> noise_count;
+	bool root_gumbel_initialized = false;
+	std::vector<double> root_gumbel_logits;
+	std::vector<bool> root_gumbel_active;
+	std::vector<int> root_gumbel_round_visits;
+	int root_gumbel_round = 0;
+	int root_gumbel_round_budget = 0;
+	int root_gumbel_round_target = 0;
 
 	// 詰み探索のステータス
 	MateSearchEntry::State mate_status;
@@ -449,18 +666,7 @@ private:
 		);
 		if (trainning) {
 			const auto child = root_node->child.get();
-			record.candidates.reserve(root_node->child_num);
-			const size_t child_num = root_node->child_num;
-			for (size_t i = 0; i < child_num; ++i) {
-				// ノイズにより選んだ回数を除く
-				const auto move_count = child[i].move_count - noise_count[i];
-				if (move_count > 0) {
-					record.candidates.emplace_back(
-						static_cast<u16>(child[i].move.value()),
-						static_cast<u16>(move_count)
-					);
-				}
-			}
+			record.candidates = BuildTrainingCandidates(child, root_node->child_num);
 			idx++;
 		}
 	}
@@ -853,6 +1059,75 @@ UCTSearcher::SelectMaxUcbChild(child_node_t* parent, uct_node_t* current)
 {
 	const child_node_t* uct_child = current->child.get();
 	const int child_num = current->child_num;
+	if (parent == nullptr && GUMBEL_ROOT && root_gumbel_initialized) {
+		int best_child = -1;
+		int best_added_visits = std::numeric_limits<int>::max();
+		double best_score = -std::numeric_limits<double>::infinity();
+		int child_win_count = 0;
+
+		for (int i = 0; i < child_num; ++i) {
+			if (!root_gumbel_active.empty() && !root_gumbel_active[i]) {
+				continue;
+			}
+			if (uct_child[i].IsWin()) {
+				child_win_count++;
+				continue;
+			}
+			if (uct_child[i].IsLose()) {
+				return i;
+			}
+
+			const int round_start =
+				i < static_cast<int>(root_gumbel_round_visits.size()) ?
+				root_gumbel_round_visits[i] :
+				0;
+			const int added_visits = std::max(0, static_cast<int>(uct_child[i].move_count) - round_start);
+			if (added_visits >= root_gumbel_round_target) {
+				continue;
+			}
+
+			const double score = GumbelRootScore(uct_child, i);
+			if (best_child < 0 || added_visits < best_added_visits || (added_visits == best_added_visits && score > best_score)) {
+				best_child = i;
+				best_added_visits = added_visits;
+				best_score = score;
+			}
+		}
+
+		if (best_child >= 0) {
+			current->visited_nnrate += uct_child[best_child].nnrate;
+			return best_child;
+		}
+
+		for (int i = 0; i < child_num; ++i) {
+			if (!root_gumbel_active.empty() && !root_gumbel_active[i]) {
+				continue;
+			}
+			if (uct_child[i].IsLose()) {
+				return i;
+			}
+			if (uct_child[i].IsWin()) {
+				child_win_count++;
+				continue;
+			}
+			const double score = GumbelRootScore(uct_child, i);
+			if (best_child < 0 || score > best_score) {
+				best_child = i;
+				best_score = score;
+			}
+		}
+
+		if (best_child >= 0) {
+			current->visited_nnrate += uct_child[best_child].nnrate;
+			return best_child;
+		}
+
+		if (child_win_count == child_num && parent != nullptr) {
+			parent->SetLose();
+		}
+		return 0;
+	}
+
 	int max_child = 0, max_child_nonoise = 0;
 	const int sum = current->move_count;
 	const WinType sum_win = current->win;
@@ -961,6 +1236,76 @@ UCTSearcherGroup::QueuingNode(const Position *pos, uct_node_t* node, float* valu
 bool
 UCTSearcher::InterruptionCheck(const int playout_count, const int extension_times)
 {
+	if (GUMBEL_ROOT && root_gumbel_initialized) {
+		const int child_num = root_node->child_num;
+		const child_node_t* uct_child = root_node->child.get();
+		int active_count = 0;
+		int round_visits = 0;
+		int lose_count = 0;
+		for (int i = 0; i < child_num; ++i) {
+			if (!root_gumbel_active.empty() && !root_gumbel_active[i]) {
+				continue;
+			}
+			active_count++;
+			if (uct_child[i].IsLose()) {
+				lose_count++;
+			}
+			const int round_start =
+				i < static_cast<int>(root_gumbel_round_visits.size()) ?
+				root_gumbel_round_visits[i] :
+				0;
+			round_visits += std::max(0, static_cast<int>(uct_child[i].move_count) - round_start);
+		}
+
+		if (active_count <= 1 || lose_count > 0 || playout_count >= max_playout_num) {
+			return true;
+		}
+
+		if (round_visits < root_gumbel_round_budget) {
+			return false;
+		}
+
+		std::vector<int> survivors;
+		survivors.reserve(active_count);
+		for (int i = 0; i < child_num; ++i) {
+			if (!root_gumbel_active.empty() && !root_gumbel_active[i]) {
+				continue;
+			}
+			survivors.emplace_back(i);
+		}
+
+		std::stable_sort(survivors.begin(), survivors.end(), [&](int lhs, int rhs) {
+			const bool lhs_lose = uct_child[lhs].IsLose();
+			const bool rhs_lose = uct_child[rhs].IsLose();
+			if (lhs_lose != rhs_lose) {
+				return lhs_lose;
+			}
+			const bool lhs_win = uct_child[lhs].IsWin();
+			const bool rhs_win = uct_child[rhs].IsWin();
+			if (lhs_win != rhs_win) {
+				return !lhs_win;
+			}
+			const double lhs_score = GumbelRootScore(uct_child, lhs);
+			const double rhs_score = GumbelRootScore(uct_child, rhs);
+			if (lhs_score != rhs_score) {
+				return lhs_score > rhs_score;
+			}
+			return uct_child[lhs].move_count > uct_child[rhs].move_count;
+		});
+
+		const int next_active_count = std::max(1, (active_count + 1) / 2);
+		std::fill(root_gumbel_active.begin(), root_gumbel_active.end(), false);
+		for (int i = 0; i < next_active_count && i < static_cast<int>(survivors.size()); ++i) {
+			root_gumbel_active[survivors[i]] = true;
+		}
+		if (next_active_count <= 1 || playout_count >= max_playout_num) {
+			return true;
+		}
+
+		StartNextGumbelRound(uct_child, child_num);
+		return false;
+	}
+
 	int max_index = 0;
 	int max = 0, second = 0;
 	const int child_num = root_node->child_num;
@@ -1100,6 +1445,7 @@ void UCTSearcher::Playout(visitor_t& visitor)
 				records.clear();
 				reason = 0;
 				root_node.reset();
+				ResetGumbelRootState();
 
 				// USIエンジン
 				if (usi_engine_turn >= 0) {
@@ -1130,6 +1476,7 @@ void UCTSearcher::Playout(visitor_t& visitor)
 
 				// ルートノード展開
 				root_node->ExpandNode(pos_root);
+				ResetGumbelRootState();
 			}
 
 			// ノイズ回数初期化
@@ -1178,6 +1525,9 @@ void UCTSearcher::Playout(visitor_t& visitor)
 					// キャッシュからnnrateをコピー
 					CopyNNRate(root_node.get(), cache_lock->nnrate);
 				}
+			}
+			if (GUMBEL_ROOT && root_node->IsEvaled() && !root_gumbel_initialized) {
+				InitializeGumbelRootState(root_node->child.get(), root_node->child_num);
 			}
 		}
 
@@ -1337,6 +1687,38 @@ void UCTSearcher::NextStep()
 				AddRecord(best_move, 0, false);
 		}
 		else {
+			if (GUMBEL_ROOT) {
+				best_move = SelectGumbelRootMove(uct_child, root_node->child_num, best_wp);
+				SPDLOG_DEBUG(
+					logger,
+					"gpu_id:{} group_id:{} id:{} ply:{} {} gumbel_bestmove:{} winrate:{}",
+					grp->gpu_id,
+					grp->group_id,
+					id,
+					ply,
+					pos_root->toSFEN(),
+					best_move.toUSI(),
+					best_wp
+				);
+
+				{
+					const float winrate = (best_wp - 0.5f) * 2.0f;
+					if (WINRATE_THRESHOLD < abs(winrate)) {
+						if (pos_root->turn() == Black)
+							gameResult = (winrate < 0 ? WhiteWin : BlackWin);
+						else
+							gameResult = (winrate < 0 ? BlackWin : WhiteWin);
+
+						NextGame();
+						return;
+					}
+				}
+
+				AddRecord(best_move, value_to_score(best_wp), true);
+				NextPly(best_move);
+				return;
+			}
+
 			// 探索回数最大の手を見つける
 			unsigned int select_index = 0;
 			int max_count = uct_child[0].move_count;
@@ -1462,6 +1844,7 @@ void UCTSearcher::NextPly(const Move move)
 	// 次の手番
 	max_playout_num = playout_num;
 	playout = 0;
+	ResetGumbelRootState();
 
 	if (usi_engine_turn >= 0) {
 		usi_position += " " + move.toUSI();
@@ -1546,6 +1929,7 @@ void UCTSearcher::NextGame()
 	// 新しいゲーム
 	playout = 0;
 	ply = 0;
+	ResetGumbelRootState();
 }
 
 // 教師局面生成
@@ -1687,6 +2071,12 @@ int main(int argc, char* argv[]) {
 			("random_temperature_drop", "random temperature drop", cxxopts::value<float>(RANDOM_TEMPERATURE_DROP)->default_value("1.0"))
 			("train_random", "train random move", cxxopts::value<bool>(TRAIN_RANDOM)->default_value("false"))
 			("random2", "random2", cxxopts::value<float>(RANDOM2)->default_value("0"))
+			("gumbel_root", "enable experimental gumbel root move selection", cxxopts::value<bool>(GUMBEL_ROOT)->default_value("false"))
+			("gumbel_scale", "gumbel noise scale", cxxopts::value<float>(GUMBEL_SCALE)->default_value("1.0"))
+			("gumbel_prior_weight", "weight for log prior in gumbel scoring", cxxopts::value<float>(GUMBEL_PRIOR_WEIGHT)->default_value("1.0"))
+			("gumbel_value_weight", "weight for q value in gumbel scoring", cxxopts::value<float>(GUMBEL_VALUE_WEIGHT)->default_value("1.0"))
+			("gumbel_visit_weight", "weight for log visit count in gumbel scoring", cxxopts::value<float>(GUMBEL_VISIT_WEIGHT)->default_value("0.25"))
+			("gumbel_export_temperature", "temperature for exporting gumbel policy targets", cxxopts::value<float>(GUMBEL_EXPORT_TEMPERATURE)->default_value("1.0"))
 			("min_move", "minimum move number", cxxopts::value<int>(MIN_MOVE)->default_value("10"), "num")
 			("max_move", "maximum move number", cxxopts::value<int>(MAX_MOVE)->default_value("320"), "num")
 			("out_max_move", "output the max move game", cxxopts::value<bool>(OUT_MAX_MOVE)->default_value("false"))
@@ -1779,6 +2169,10 @@ int main(int argc, char* argv[]) {
 		cerr << "too few threshold" << endl;
 		return 0;
 	}
+	if (GUMBEL_SCALE < 0 || GUMBEL_EXPORT_TEMPERATURE <= 0) {
+		cerr << "invalid gumbel parameters" << endl;
+		return 0;
+	}
 	if (MATE_SEARCH_MAX_NODE < MATE_SEARCH_MIN_NODE) {
 		cerr << "too few mate nodes" << endl;
 		return 0;
@@ -1817,6 +2211,12 @@ int main(int argc, char* argv[]) {
 	logger->info("random_temperature_drop:{}", RANDOM_TEMPERATURE_DROP);
 	logger->info("train_random:{}", TRAIN_RANDOM);
 	logger->info("random2:{}", RANDOM2);
+	logger->info("gumbel_root:{}", GUMBEL_ROOT);
+	logger->info("gumbel_scale:{}", GUMBEL_SCALE);
+	logger->info("gumbel_prior_weight:{}", GUMBEL_PRIOR_WEIGHT);
+	logger->info("gumbel_value_weight:{}", GUMBEL_VALUE_WEIGHT);
+	logger->info("gumbel_visit_weight:{}", GUMBEL_VISIT_WEIGHT);
+	logger->info("gumbel_export_temperature:{}", GUMBEL_EXPORT_TEMPERATURE);
 	logger->info("min_move:{}", MIN_MOVE);
 	logger->info("max_move:{}", MAX_MOVE);
 	logger->info("out_max_move:{}", OUT_MAX_MOVE);

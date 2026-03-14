@@ -86,5 +86,22 @@ python -m dlshogi.train --config dlshogi/config.yaml --lr 0.0005 --epoch 10
 --network wideresnet10
 ```
 
+### 自己対局の実験オプション（Gumbel root）
+`selfplay/self_play.cpp` には、既存の `hcpe3` 学習パイプラインを保ったまま
+ルート探索を Gumbel 方式で試す実験オプションがあります。
+内部ノードの探索は従来の PUCT のままで、ルートでは Gumbel ノイズ付きスコアで候補を並べ、
+round ごとに候補を半減させながら探索予算を配る実装です。
+
+```bash
+--gumbel_root
+--gumbel_scale 1.0
+--gumbel_prior_weight 1.0
+--gumbel_value_weight 1.0
+--gumbel_visit_weight 0.25
+--gumbel_export_temperature 1.0
+```
+
+`--gumbel_root` を指定しなければ、従来の自己対局挙動は変わりません。
+
 ## ライセンス
 ライセンスはGPL3ライセンスとします。
